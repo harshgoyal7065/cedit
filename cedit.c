@@ -1,23 +1,45 @@
+/*** includes ***/
 #include <ctype.h>
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
+#include <string.h>
 
+/** defines */
 #define CTRL_KEY(k) ((k) & 0x1f)
+
+/** data */
+struct editorConfig
+{
+    int screen_rows;
+    int screen_cols;
+    struct termios orig_termios;
+};
+struct editorConfig E;
 
 struct termios orig_termios; // Original termios structure, needed to restore once the user exits the program
 
 /** Print error message and exit */
-void die(const char *s) {
+void die(const char *s)
+{
+    /**
+     * Clear the screen and reposition the cursor when our program exits.
+     * If an error occurs in the middle of rendering the screen, we don’t want a bunch of garbage left over on the screen
+     */
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+
     perror(s);
     exit(1);
 }
 
-void disableRawMode() {
+void disableRawMode()
+{
     // Set attribute as initial termios once the program exits.
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
         die("tcsetattr");
 }
 
@@ -25,9 +47,11 @@ void disableRawMode() {
     By Default, our terminal is in cooked or canonical mode. This means that the string we enter is received by the program only when we press 'Enter'
     In order to run the program on each key-press, we have to turn on the raw mode. This functions enables raw mode.
 */
-void enableRawMode() {
+void enableRawMode()
+{
     // int tcgetattr(int fildes, struct termios *termios_p)
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) die("tcgetattr");
+    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
+        die("tcgetattr");
     atexit(disableRawMode); // Call disableRawMode function at program exit (from "stdlib.h")
     /**
         We can set a terminal’s attributes by
@@ -36,7 +60,7 @@ void enableRawMode() {
             3. passing the modified struct to tcsetattr() to write the new terminal attributes back out.
         All these functions are given by termios.h
      */
-    struct termios raw = orig_termios; // struct termios is given by termios.h and represents the terminal structure for C.
+    struct termios raw = E.orig_termios; // struct termios is given by termios.h and represents the terminal structure for C.
 
     /**
         Ctrl-S stops data from being transmitted to the terminal until you press Ctrl-Q.
@@ -81,32 +105,216 @@ void enableRawMode() {
     */
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 1;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr"); // TCSAFLUSH argument specifies when to apply the change: in this case, it waits for all pending output to be written to the terminal, and also discards any input that hasn’t been read.
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
+        die("tcsetattr"); // TCSAFLUSH argument specifies when to apply the change: in this case, it waits for all pending output to be written to the terminal, and also discards any input that hasn’t been read.
 }
 
-char editorReadKey() {
+char editorReadKey()
+{
     int nread;
     char c;
     /** Read from Standard input */
-    while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
-        if (nread == -1 && errno != EAGAIN) die("read");
+    while ((nread = read(STDIN_FILENO, &c, 1)) != 1)
+    {
+        if (nread == -1 && errno != EAGAIN)
+            die("read");
     }
     return c;
 }
 
-void editorProcessKeypress() {
+/**
+ * Get Current Cursor position
+ */
+int getCursorPosition(int *rows, int *cols)
+{
+    char buf[32];
+    unsigned int i = 0;
+    /**
+     * The n command (Device Status Report) can be used to query the terminal for status information.
+     * We want to give it an argument of 6 to ask for the cursor position.
+     * The reply is an escape sequence! It’s an escape character (27),
+     * followed by a [ character, and then the actual response: 24;80R, or similar. (This escape sequence is documented as Cursor Position Report.)
+     * Cursor Position Report - https://vt100.net/docs/vt100-ug/chapter3.html#CPR
+     */
+    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
+        return -1;
+
+    /**
+     * When we print out the buffer, we don’t want to print the '\x1b' character, because the terminal would interpret it as an escape sequence
+     * and wouldn’t display it. So we skip the first character in buf by passing &buf[1] to printf().
+     * printf() expects strings to end with a 0 byte, so we make sure to assign '\0' to the final byte of buf.
+     */
+    while (i < sizeof(buf) - 1)
+    {
+        if (read(STDIN_FILENO, &buf[i], 1) != 1)
+            break;
+        if (buf[i] == 'R')
+            break;
+        i++;
+    }
+    buf[i] = '\0';
+    // printf("\r\n&buf[1]: '%s'\r\n", &buf[1]);
+    // editorReadKey();
+    if (buf[0] != '\x1b' || buf[1] != '[')
+        return -1;
+    if (sscanf(&buf[2], "%d;%d", rows, cols) != 2)
+        return -1;
+    return -1;
+}
+
+int getWindowSize(int *rows, int *cols)
+{
+    /**
+     * ioctl(), TIOCGWINSZ, and struct winsize come from <sys/ioctl.h>.
+     * On success, ioctl() will place the number of columns wide and the number of rows high the terminal
+     * is into the given winsize struct. On failure, ioctl() returns -1.
+     */
+    struct winsize ws;
+    /**
+     * There is no simple “move the cursor to the bottom-right corner” command
+     */
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
+    {
+        /**
+         * We are sending two escape sequences one after the other.
+         * The C command (Cursor Forward) moves the cursor to the right, and the B command (Cursor Down) moves the cursor down.
+         * The argument says how much to move it right or down by. We use a very large value, 999, which should ensure that the
+         * cursor reaches the right and bottom edges of the screen.
+         * The C and B commands are specifically documented to stop the cursor from going past the edge of the screen.
+         * The reason we don’t use the <esc>[999;999H command is that the documentation doesn’t specify what happens when
+         *  you try to move the cursor off-screen.
+         */
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
+            return -1;
+        editorReadKey();
+        return -1;
+    }
+    else
+    {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        return 0;
+    }
+}
+
+/**
+ * We want to replace all our write() calls with code that appends the string to a buffer,
+ * and then write() this buffer out at the end. Unfortunately, C doesn’t have dynamic strings, so we’ll create our own dynamic string
+ * type that supports one operation: appending.
+ * An append buffer consists of a pointer to our buffer in memory,
+ * and a length. We define an ABUF_INIT constant which represents an empty buffer. This acts as a constructor for our abuf type.
+ */
+struct abuf
+{
+    char *b;
+    int len;
+};
+#define ABUF_INIT {NULL, 0}
+
+/**
+ * realloc() and free() come from <stdlib.h>. memcpy() comes from <string.h>
+ * To append a string s to an abuf, the first thing we do is make sure we allocate enough memory to hold the new string.
+ * We ask realloc() to give us a block of memory that is the size of the current string plus the size of the string we are appending.
+ * realloc() will either extend the size of the block of memory we already have allocated, or it will take care of free()ing the
+ * current block of memory and allocating a new block of memory somewhere else that is big enough for our new string.
+ * Then we use memcpy() to copy the string s after the end of the current data in the buffer,
+ * and we update the pointer and length of the abuf to the new values.
+ */
+void abAppend(struct abuf *ab, const char *s, int len)
+{
+    char *new = realloc(ab->b, ab->len + len);
+    if (new == NULL)
+        return;
+    memcpy(&new[ab->len], s, len);
+    ab->b = new;
+    ab->len += len;
+}
+
+/**
+ * abFree() is a destructor that deallocates the dynamic memory used by an abuf.
+ */
+void abFree(struct abuf *ab)
+{
+    free(ab->b);
+}
+
+void editorProcessKeypress()
+{
     char c = editorReadKey();
-    switch (c) {
-        case CTRL_KEY('q'):
+    switch (c)
+    {
+    case CTRL_KEY('q'):
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
         exit(0);
         break;
     }
 }
 
-int main() {
-    enableRawMode();
+/** Function to draw a screen of tilde */
+void editorDrawRows(struct abuf *ab)
+{
+    int y;
+    for (y = 0; y < E.screen_rows; y++)
+    {
+        abAppend(ab, "~", 1);
+        abAppend(ab, "\x1b[K", 3);
+        if (y < E.screen_rows - 1)
+        {
+            abAppend(ab, "\r\n", 2);
+        }
+    }
+}
 
-    while (1) {
+/** Function to Refresh the screen */
+void editorRefreshScreen()
+{
+    struct abuf ab = ABUF_INIT;
+    /**
+     * write() and STDOUT_FILENO come from <unistd.h>.
+     * 4 in our write() call means we are writing 4 bytes out to the terminal. The first byte is \x1b, which is the escape character, or 27 in decimal.
+     * The other three bytes are [2J
+     * We are writing an escape sequence to the terminal. Escape sequences always start with an escape character (27) followed by a [ character.
+     * We are using the J command (Erase In Display) to clear the screen
+     * H command (Cursor Position) to position the cursor.
+     * We are using VT100 escape sequence guide - https://vt100.net/docs/vt100-ug/chapter3.html
+     */
+    abAppend(&ab, "\x1b[?25l", 6);
+    abAppend(&ab, "\x1b[2J", 4);
+    abAppend(&ab, "\x1b[H", 3);
+
+    editorDrawRows(&ab);
+
+    abAppend(&ab, "\x1b[H", 3);
+    /**
+     * We use escape sequences to tell the terminal to hide and show the cursor.
+     * The h and l commands (Set Mode, Reset Mode) are used to turn on and turn off various terminal features or “modes”.
+     * The VT100 User Guide just linked to doesn’t document argument ?25 which we use above.
+     * It appears the cursor hiding/showing feature appeared in later VT models.
+     */
+    abAppend(&ab, "\x1b[?25h", 6);
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+}
+
+/**
+ * Function to initialize Editor
+ */
+void initEditor()
+{
+    if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1)
+        die("getWindowSize");
+}
+
+int main()
+{
+    enableRawMode();
+    initEditor();
+
+    while (1)
+    {
+        editorRefreshScreen();
         editorProcessKeypress();
     }
 
