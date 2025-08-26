@@ -9,11 +9,26 @@
 #include <string.h>
 
 /** defines */
+#define CEDIT_VERSION "0.0.0"
 #define CTRL_KEY(k) ((k) & 0x1f)
+
+enum editorKey
+{
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    PAGE_UP,
+    PAGE_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DEL_KEY
+};
 
 /** data */
 struct editorConfig
 {
+    int cx, cy;
     int screen_rows;
     int screen_cols;
     struct termios orig_termios;
@@ -109,7 +124,7 @@ void enableRawMode()
         die("tcsetattr"); // TCSAFLUSH argument specifies when to apply the change: in this case, it waits for all pending output to be written to the terminal, and also discards any input that hasn’t been read.
 }
 
-char editorReadKey()
+int editorReadKey()
 {
     int nread;
     char c;
@@ -119,7 +134,84 @@ char editorReadKey()
         if (nread == -1 && errno != EAGAIN)
             die("read");
     }
-    return c;
+    /**
+     * Pressing an arrow key sends multiple bytes as input to our program.
+     * These bytes are in the form of an escape sequence that starts with '\x1b', '[', followed by an 'A', 'B', 'C', or 'D'
+     * depending on which of the four arrow keys was pressed.
+     */
+    if (c == '\x1b')
+    {
+        char seq[3];
+        if (read(STDIN_FILENO, &seq[0], 1) != 1)
+            return '\x1b';
+        if (read(STDIN_FILENO, &seq[1], 1) != 1)
+            return '\x1b';
+        if (seq[0] == '[')
+        {
+            /**
+             * Handling escape sequence of page up and page down
+             * The Home key could be sent as <esc>[1~, <esc>[7~, <esc>[H, or <esc>OH. Similarly, the End key could be sent as <esc>[4~, <esc>[8~, <esc>[F, or <esc>OF
+             */
+            if (seq[1] >= '0' && seq[1] <= '9')
+            {
+                if (read(STDIN_FILENO, &seq[2], 1) != 1)
+                    return '\x1b';
+                if (seq[2] == '~')
+                {
+                    switch (seq[1])
+                    {
+                    case '1':
+                        return HOME_KEY;
+                    case '3':
+                        return DEL_KEY;
+                    case '4':
+                        return END_KEY;
+                    case '5':
+                        return PAGE_UP;
+                    case '6':
+                        return PAGE_DOWN;
+                    case '7':
+                        return HOME_KEY;
+                    case '8':
+                        return END_KEY;
+                    }
+                }
+            }
+            else
+            {
+                switch (seq[1])
+                {
+                case 'A':
+                    return ARROW_UP;
+                case 'B':
+                    return ARROW_DOWN;
+                case 'C':
+                    return ARROW_RIGHT;
+                case 'D':
+                    return ARROW_LEFT;
+                case 'H':
+                    return HOME_KEY;
+                case 'F':
+                    return END_KEY;
+                }
+            }
+        }
+        else if (seq[0] == 'O')
+        {
+            switch (seq[1])
+            {
+            case 'H':
+                return HOME_KEY;
+            case 'F':
+                return END_KEY;
+            }
+            return '\x1b';
+        }
+    }
+    else
+    {
+        return c;
+    }
 }
 
 /**
@@ -238,15 +330,68 @@ void abFree(struct abuf *ab)
     free(ab->b);
 }
 
+void editorMoveCursor(int key)
+{
+    switch (key)
+    {
+    case ARROW_LEFT:
+        if (E.cx != 0)
+        {
+            E.cx--;
+        }
+        break;
+    case ARROW_RIGHT:
+        if (E.cx != E.screen_cols - 1)
+        {
+            E.cx++;
+        }
+        break;
+    case ARROW_UP:
+        if (E.cy != 0)
+        {
+            E.cy--;
+        }
+        break;
+    case ARROW_DOWN:
+        if (E.cy != E.screen_rows - 1)
+        {
+            E.cy++;
+        }
+        break;
+    }
+}
 void editorProcessKeypress()
 {
-    char c = editorReadKey();
+    int c = editorReadKey();
     switch (c)
     {
     case CTRL_KEY('q'):
         write(STDOUT_FILENO, "\x1b[2J", 4);
         write(STDOUT_FILENO, "\x1b[H", 3);
         exit(0);
+        break;
+
+    case PAGE_UP:
+    case PAGE_DOWN:
+    { // We create a code block with that pair of braces so that we’re allowed to declare the times variable. (You can’t declare variables directly inside a switch statement.)
+        int times = E.screen_rows;
+        while (times--)
+            editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+    }
+    break;
+
+    case HOME_KEY:
+        E.cx = 0;
+        break;
+    case END_KEY:
+        E.cx = E.screen_cols - 1;
+        break;
+
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+        editorMoveCursor(c);
         break;
     }
 }
@@ -257,7 +402,34 @@ void editorDrawRows(struct abuf *ab)
     int y;
     for (y = 0; y < E.screen_rows; y++)
     {
-        abAppend(ab, "~", 1);
+        if (y == E.screen_rows / 3)
+        {
+            char welcome[80];
+            int welcome_len = snprintf(welcome, sizeof(welcome),
+                                       "Cedit editor -- version %s", CEDIT_VERSION);
+            if (welcome_len > E.screen_cols)
+                welcome_len = E.screen_cols;
+            /**
+             * To center a string, you divide the screen width by 2,
+             * and then subtract half of the string’s length from that. In other words:
+             * E.screen_cols/2 - welcome_len/2, which simplifies to (E.screen_cols - welcome_len) / 2.
+             * That tells you how far from the left edge of the screen you should start printing the string.
+             * So we fill that space with space characters, except for the first character, which should be a tilde.
+             */
+            int padding = (E.screen_cols - welcome_len) / 2;
+            if (padding)
+            {
+                abAppend(ab, "~", 1);
+                padding--;
+            }
+            while (padding--)
+                abAppend(ab, " ", 1);
+            abAppend(ab, welcome, welcome_len);
+        }
+        else
+        {
+            abAppend(ab, "~", 1);
+        }
         abAppend(ab, "\x1b[K", 3);
         if (y < E.screen_rows - 1)
         {
@@ -280,12 +452,19 @@ void editorRefreshScreen()
      * We are using VT100 escape sequence guide - https://vt100.net/docs/vt100-ug/chapter3.html
      */
     abAppend(&ab, "\x1b[?25l", 6);
-    abAppend(&ab, "\x1b[2J", 4);
     abAppend(&ab, "\x1b[H", 3);
 
     editorDrawRows(&ab);
 
-    abAppend(&ab, "\x1b[H", 3);
+    /**
+     * We changed the old H command into an H command with arguments, specifying the exact position we want the cursor to move to.
+     * We add 1 to E.cy and E.cx to convert from 0-indexed values to the 1-indexed values that the terminal uses.
+     * Now, we’ll allow the user to move the cursor using the wasd keys. (If you’re unfamiliar with using these keys as arrow keys: w is your up arrow, s is your down arrow, a is left, d is right.)
+     * **/
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    abAppend(&ab, buf, strlen(buf));
+
     /**
      * We use escape sequences to tell the terminal to hide and show the cursor.
      * The h and l commands (Set Mode, Reset Mode) are used to turn on and turn off various terminal features or “modes”.
@@ -303,6 +482,9 @@ void editorRefreshScreen()
  */
 void initEditor()
 {
+    E.cx = 0;
+    E.cy = 0;
+
     if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1)
         die("getWindowSize");
 }
