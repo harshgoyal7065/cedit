@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <string.h>
+#include <sys/types.h>
 
 /** defines */
 #define CEDIT_VERSION "0.0.0"
@@ -26,11 +27,24 @@ enum editorKey
 };
 
 /** data */
+
+/**
+ * erow stands for “editor row”, and stores a line of text as a pointer to the dynamically-allocated character data and a length.
+ * The typedef lets us refer to the type as erow instead of struct erow.
+ */
+typedef struct erow
+{
+    int size;
+    char *chars;
+} erow;
+
 struct editorConfig
 {
     int cx, cy;
     int screen_rows;
     int screen_cols;
+    int num_rows;
+    erow row;
     struct termios orig_termios;
 };
 struct editorConfig E;
@@ -290,6 +304,36 @@ int getWindowSize(int *rows, int *cols)
 }
 
 /**
+ * editorOpen() will eventually be for opening and reading a file from disk, so we put it in a new file i/o section.
+ * To load our “Hello, world” message into the editor’s erow struct, we set the size field to the length of our message, malloc() the necessary memory,
+ * and memcpy() the message to the chars field which points to the memory we allocated. Finally, we set the E.numrows variable to 1,
+ * to indicate that the erow now contains a line that should be displayed.
+ */
+
+void editorOpen(char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp)
+        die("fopen");
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    linelen = getline(&line, &linecap, fp);
+    if (linelen != -1)
+    {
+        while (linelen > 0 && (line[linelen - 1] == '\n' ||
+                               line[linelen - 1] == '\r'))
+            linelen--;
+        E.row.size = linelen;
+        E.row.chars = malloc(linelen + 1);
+        memcpy(E.row.chars, line, linelen);
+        E.row.chars[linelen] = '\0';
+        E.num_rows = 1;
+    }
+    free(line);
+    fclose(fp);
+}
+/**
  * We want to replace all our write() calls with code that appends the string to a buffer,
  * and then write() this buffer out at the end. Unfortunately, C doesn’t have dynamic strings, so we’ll create our own dynamic string
  * type that supports one operation: appending.
@@ -402,33 +446,44 @@ void editorDrawRows(struct abuf *ab)
     int y;
     for (y = 0; y < E.screen_rows; y++)
     {
-        if (y == E.screen_rows / 3)
+        if (y >= E.num_rows)
         {
-            char welcome[80];
-            int welcome_len = snprintf(welcome, sizeof(welcome),
-                                       "Cedit editor -- version %s", CEDIT_VERSION);
-            if (welcome_len > E.screen_cols)
-                welcome_len = E.screen_cols;
-            /**
-             * To center a string, you divide the screen width by 2,
-             * and then subtract half of the string’s length from that. In other words:
-             * E.screen_cols/2 - welcome_len/2, which simplifies to (E.screen_cols - welcome_len) / 2.
-             * That tells you how far from the left edge of the screen you should start printing the string.
-             * So we fill that space with space characters, except for the first character, which should be a tilde.
-             */
-            int padding = (E.screen_cols - welcome_len) / 2;
-            if (padding)
+
+            if (y == E.screen_rows / 3)
+            {
+                char welcome[80];
+                int welcome_len = snprintf(welcome, sizeof(welcome),
+                                           "Cedit editor -- version %s", CEDIT_VERSION);
+                if (welcome_len > E.screen_cols)
+                    welcome_len = E.screen_cols;
+                /**
+                 * To center a string, you divide the screen width by 2,
+                 * and then subtract half of the string’s length from that. In other words:
+                 * E.screen_cols/2 - welcome_len/2, which simplifies to (E.screen_cols - welcome_len) / 2.
+                 * That tells you how far from the left edge of the screen you should start printing the string.
+                 * So we fill that space with space characters, except for the first character, which should be a tilde.
+                 */
+                int padding = (E.screen_cols - welcome_len) / 2;
+                if (padding)
+                {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--)
+                    abAppend(ab, " ", 1);
+                abAppend(ab, welcome, welcome_len);
+            }
+            else
             {
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while (padding--)
-                abAppend(ab, " ", 1);
-            abAppend(ab, welcome, welcome_len);
         }
         else
         {
-            abAppend(ab, "~", 1);
+            int len = E.row.size;
+            if (len > E.screen_cols)
+                len = E.screen_cols;
+            abAppend(ab, E.row.chars, len);
         }
         abAppend(ab, "\x1b[K", 3);
         if (y < E.screen_rows - 1)
@@ -484,15 +539,20 @@ void initEditor()
 {
     E.cx = 0;
     E.cy = 0;
+    E.num_rows = 0;
 
     if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1)
         die("getWindowSize");
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     enableRawMode();
     initEditor();
+    if (argc >= 2)
+    {
+        editorOpen(argv[1]);
+    }
 
     while (1)
     {
